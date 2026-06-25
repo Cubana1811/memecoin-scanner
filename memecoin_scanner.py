@@ -91,12 +91,17 @@ def fetch_goplus(address, chain_key):
             timeout=12,
         )
         data = resp.json()
-        if data.get("code") != 1:
+        if not isinstance(data, dict) or data.get("code") != 1:
             return None
-        result = data.get("result", {})
-        return result.get(address.lower()) or result.get(address)
+        result = data.get("result") or {}
+        if not isinstance(result, dict):
+            return None
+        token_data = result.get(address.lower()) or result.get(address)
+        if not isinstance(token_data, dict):
+            return None
+        return token_data
     except Exception as e:
-        log.error("GoPlus error: %s" % e)
+        log.warning("GoPlus error: %s" % e)
         return None
 
 def fetch_dexscreener(address):
@@ -116,12 +121,15 @@ def fetch_dexscreener(address):
 
 def fetch_solscan_holders(address):
     try:
-        resp = requests.get(SOLSCAN_HOLDERS % address, timeout=10,
+        resp = requests.get(SOLSCAN_HOLDERS % address, timeout=8,
                             headers={"accept": "application/json"})
+        if not resp.content:
+            return [], 0
         data = resp.json()
-        return data.get("data", []), data.get("total", 0)
-    except Exception as e:
-        log.warning("Solscan holders error: %s" % e)
+        if not isinstance(data, dict):
+            return [], 0
+        return data.get("data") or [], data.get("total") or 0
+    except Exception:
         return [], 0
 
 def fetch_latest_tokens():
