@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+memecoin_seen.json
+memecoin_results.json
