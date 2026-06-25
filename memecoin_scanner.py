@@ -1,560 +1,586 @@
 """
-Memecoin Scanner — automatically scans new tokens on ETH, BSC, and Base.
+Memecoin Scanner — multi-chain gem finder with 26-point safety scoring.
 
-Runs every 5 minutes. For every new token found it runs 26 checks across:
-  - GoPlusLabs API  (security: honeypot, taxes, functions, ownership)
-  - DexScreener API (market: MC, volume, liquidity, buys/sells, holders)
+Chains: Ethereum, BSC, Base, Solana, Arbitrum, Polygon, Avalanche
 
-Hard gates: any critical security failure = instant reject, no score shown.
-Scoring: 100 points across security, distribution, and market quality.
+Hard gates (instant fail):
+  EVM:    honeypot, unverified contract, sell_tax > 15%, buy_tax > 15%,
+          asymmetric tax (sell > buy + 5%)
+  Solana: non-transferable, transfer_hook (honeypot)
 
-Alerts sent for:
-  A grade (80+)  — strong candidate
-  B grade (65–79) — moderate candidate (proceed with caution)
+Scored checks — 100 pts total:
+  Security     40 pts
+  Distribution 25 pts
+  Market       35 pts
+
+Grade A >= 80  |  Grade B >= 65  |  Below 65 = skip
 
 Commands:
-  /scan ADDRESS [CHAIN]  — manually scan any token address
-                           chain: eth, bsc, base (default: auto-detect)
-  /recent                — last 10 tokens that passed screening
+  /scan ADDRESS [chain]   — manual scan (chain optional, auto-detected for Solana)
+  /recent                 — last 10 results
   /help
 """
 
 import os
+import re
 import json
 import time
 import logging
-import requests
 import asyncio
+import requests
 from datetime import datetime, timezone
 from telegram import Bot
 
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHAT_ID         = os.environ.get("CHAT_ID", "YOUR_CHAT_ID_HERE")
-SCAN_INTERVAL   = 300        # 5 minutes
-SEEN_FILE       = "memecoin_seen.json"
-RESULTS_FILE    = "memecoin_results.json"
-MAX_SEEN        = 2000
-POLL_INTERVAL   = 2
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CHAT_ID          = os.environ.get("CHAT_ID", "YOUR_CHAT_ID_HERE")
+SEEN_FILE        = "memecoin_seen.json"
+RESULTS_FILE     = "memecoin_results.json"
+SCAN_INTERVAL    = 300   # 5 minutes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── API endpoints ─────────────────────────────────────────────────────────────
+# ── Chain registry ────────────────────────────────────────────────────────────
+
+CHAIN_MAP = {
+    # Ethereum
+    "ethereum":  {"goplus_id": "1",       "dex_id": "ethereum",  "label": "Ethereum"},
+    "eth":       {"goplus_id": "1",       "dex_id": "ethereum",  "label": "Ethereum"},
+    # BNB Smart Chain
+    "bsc":       {"goplus_id": "56",      "dex_id": "bsc",       "label": "BSC"},
+    "bnb":       {"goplus_id": "56",      "dex_id": "bsc",       "label": "BSC"},
+    # Base
+    "base":      {"goplus_id": "8453",    "dex_id": "base",      "label": "Base"},
+    # Solana
+    "solana":    {"goplus_id": "solana",  "dex_id": "solana",    "label": "Solana"},
+    "sol":       {"goplus_id": "solana",  "dex_id": "solana",    "label": "Solana"},
+    # Arbitrum
+    "arbitrum":  {"goplus_id": "42161",   "dex_id": "arbitrum",  "label": "Arbitrum"},
+    "arb":       {"goplus_id": "42161",   "dex_id": "arbitrum",  "label": "Arbitrum"},
+    # Polygon
+    "polygon":   {"goplus_id": "137",     "dex_id": "polygon",   "label": "Polygon"},
+    "matic":     {"goplus_id": "137",     "dex_id": "polygon",   "label": "Polygon"},
+    # Avalanche
+    "avalanche": {"goplus_id": "43114",   "dex_id": "avalanche", "label": "Avalanche"},
+    "avax":      {"goplus_id": "43114",   "dex_id": "avalanche", "label": "Avalanche"},
+}
+
+# DexScreener chain name → our canonical key
+DEX_TO_CHAIN = {
+    "ethereum":  "ethereum",
+    "bsc":       "bsc",
+    "base":      "base",
+    "solana":    "solana",
+    "arbitrum":  "arbitrum",
+    "polygon":   "polygon",
+    "avalanche": "avalanche",
+}
 
 GOPLUS_URL        = "https://api.gopluslabs.io/api/v1/token_security/%s"
 DEXSCREEN_LATEST  = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREEN_TOKEN   = "https://api.dexscreener.com/latest/dex/tokens/%s"
 
-CHAIN_MAP = {
-    "ethereum": {"goplus_id": "1",    "label": "ETH"},
-    "bsc":      {"goplus_id": "56",   "label": "BSC"},
-    "base":     {"goplus_id": "8453", "label": "BASE"},
-}
+# ── Address helpers ───────────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def is_solana_address(address):
+    return bool(re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', address))
 
-def safe_get(url, timeout=15):
+def is_evm_address(address):
+    return bool(re.match(r'^0x[0-9a-fA-F]{40}$', address))
+
+def guess_chain(address):
+    if is_solana_address(address):
+        return "solana"
+    return None   # EVM but chain unknown — user must specify
+
+# ── Data fetchers ─────────────────────────────────────────────────────────────
+
+def fetch_goplus(address, chain_key):
+    chain_info = CHAIN_MAP.get(chain_key, {})
+    goplus_id  = chain_info.get("goplus_id", "1")
     try:
-        r = requests.get(url, timeout=timeout,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200:
-            return r.json()
+        url  = GOPLUS_URL % goplus_id
+        resp = requests.get(url, params={"contract_addresses": address}, timeout=12)
+        data = resp.json()
+        if data.get("code") != 1:
+            return None
+        result = data.get("result", {})
+        return result.get(address.lower()) or result.get(address)
     except Exception as e:
-        log.warning("HTTP error %s: %s" % (url[:60], e))
-    return None
+        log.error("GoPlus error: %s" % e)
+        return None
+
+def fetch_dexscreener(address):
+    try:
+        resp  = requests.get(DEXSCREEN_TOKEN % address, timeout=12)
+        data  = resp.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+        pairs.sort(
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+            reverse=True,
+        )
+        return pairs[0]
+    except Exception as e:
+        log.error("DexScreener error: %s" % e)
+        return None
+
+def fetch_latest_tokens():
+    try:
+        resp = requests.get(DEXSCREEN_LATEST, timeout=12)
+        return resp.json() if isinstance(resp.json(), list) else []
+    except Exception as e:
+        log.error("DexScreen latest error: %s" % e)
+        return []
+
+# ── Scoring engine ────────────────────────────────────────────────────────────
+
+def score_token(gp, dex, chain_key):
+    """
+    Returns (score, grade, passed, failed, hard_fail_reason)
+    """
+    is_sol = (CHAIN_MAP.get(chain_key, {}).get("goplus_id") == "solana")
+    passed = []
+    failed = []
+    score  = 0
+
+    # ── HARD GATES ────────────────────────────────────────────────────────────
+
+    if is_sol:
+        if gp:
+            if str(gp.get("non_transferable", "0")) == "1":
+                return 0, "F", [], [], "HARD FAIL: Token is non-transferable (cannot sell)"
+            if str(gp.get("transfer_hook", "0")) == "1":
+                return 0, "F", [], [], "HARD FAIL: Transfer hook detected (likely honeypot)"
+    else:
+        if gp:
+            if str(gp.get("is_honeypot", "0")) == "1":
+                return 0, "F", [], [], "HARD FAIL: Honeypot confirmed"
+            if str(gp.get("is_open_source", "1")) == "0":
+                return 0, "F", [], [], "HARD FAIL: Contract not verified"
+            sell_tax = float(gp.get("sell_tax") or 0)
+            buy_tax  = float(gp.get("buy_tax") or 0)
+            if sell_tax > 15:
+                return 0, "F", [], [], "HARD FAIL: Sell tax %.1f%% > 15%%" % sell_tax
+            if buy_tax > 15:
+                return 0, "F", [], [], "HARD FAIL: Buy tax %.1f%% > 15%%" % buy_tax
+            if sell_tax > buy_tax + 5:
+                return 0, "F", [], [], "HARD FAIL: Asymmetric tax — sell %.1f%% vs buy %.1f%%" % (sell_tax, buy_tax)
+
+    # ── SECURITY CHECKS (40 pts) ──────────────────────────────────────────────
+
+    if is_sol:
+        if gp:
+            if str(gp.get("mintable", "0")) == "0":
+                score += 12; passed.append("No mint authority (+12)")
+            else:
+                failed.append("MINTABLE — supply can be inflated")
+
+            if str(gp.get("freezable", "0")) == "0":
+                score += 12; passed.append("No freeze authority (+12)")
+            else:
+                failed.append("FREEZABLE — accounts can be frozen")
+
+            if str(gp.get("transfer_fee", "0")) == "0":
+                score += 8; passed.append("No transfer fee (+8)")
+            else:
+                failed.append("Transfer fee present")
+
+            if str(gp.get("metadata_mutable", "0")) == "0":
+                score += 8; passed.append("Metadata immutable (+8)")
+            else:
+                failed.append("Metadata mutable — branding can change")
+        else:
+            failed.append("GoPlus security data unavailable")
+
+    else:  # EVM chains
+        if gp:
+            if str(gp.get("is_mintable", "0")) == "0":
+                score += 10; passed.append("No mint function (+10)")
+            else:
+                failed.append("MINTABLE — supply can be inflated")
+
+            if str(gp.get("is_blacklisted", "0")) == "0":
+                score += 8; passed.append("No blacklist function (+8)")
+            else:
+                failed.append("BLACKLIST present — wallets can be blocked")
+
+            if str(gp.get("transfer_pausable", "0")) == "0":
+                score += 7; passed.append("Transfers cannot be paused (+7)")
+            else:
+                failed.append("Transfers can be paused by owner")
+
+            if str(gp.get("is_proxy", "0")) == "0":
+                score += 5; passed.append("No proxy contract (+5)")
+            else:
+                failed.append("Proxy contract — logic can be replaced")
+
+            if str(gp.get("hidden_owner", "0")) == "0":
+                score += 5; passed.append("No hidden owner (+5)")
+            else:
+                failed.append("Hidden owner detected")
+
+            owner = gp.get("owner_address") or ""
+            if not owner or owner == "0x0000000000000000000000000000000000000000":
+                score += 5; passed.append("Ownership renounced (+5)")
+            else:
+                failed.append("Ownership NOT renounced")
+        else:
+            failed.append("GoPlus security data unavailable")
+
+    # ── DISTRIBUTION CHECKS (25 pts) ──────────────────────────────────────────
+
+    if is_sol:
+        score += 15
+        passed.append("Solana distribution (partial, +15)")
+    else:
+        if gp:
+            creator_pct = float(gp.get("creator_percent") or 0)
+            if creator_pct < 5:
+                score += 10; passed.append("Dev wallet %.1f%% < 5%% (+10)" % creator_pct)
+            else:
+                failed.append("Dev wallet %.1f%% >= 5%%" % creator_pct)
+
+            holders = gp.get("holders") or []
+            if holders:
+                top10_pct = sum(float(h.get("percent", 0)) for h in holders[:10]) * 100
+                if top10_pct < 20:
+                    score += 8; passed.append("Top 10 hold %.1f%% < 20%% (+8)" % top10_pct)
+                else:
+                    failed.append("Top 10 hold %.1f%% >= 20%%" % top10_pct)
+
+            lp_holders    = gp.get("lp_holders") or []
+            lp_locked     = any(str(lp.get("is_locked", "0")) == "1" for lp in lp_holders)
+            lp_holder_info = gp.get("lp_holder_analysis") or {}
+            if isinstance(lp_holder_info, dict):
+                lp_locked = lp_locked or str(lp_holder_info.get("is_locked", "0")) == "1"
+            if lp_locked:
+                score += 7; passed.append("LP locked (+7)")
+            else:
+                failed.append("LP NOT locked — can be pulled")
+
+    # ── MARKET CHECKS (35 pts) ────────────────────────────────────────────────
+
+    if dex:
+        mc      = float((dex.get("fdv") or dex.get("marketCap") or 0))
+        liq     = float((dex.get("liquidity") or {}).get("usd") or 0)
+        vol24h  = float((dex.get("volume") or {}).get("h24") or 0)
+        buys    = float((dex.get("txns") or {}).get("h24", {}).get("buys") or 0)
+        sells   = float((dex.get("txns") or {}).get("h24", {}).get("sells") or 1)
+        age_ms  = dex.get("pairCreatedAt") or 0
+        age_h   = (time.time() * 1000 - age_ms) / 3600000 if age_ms else 0
+
+        # MC $500K–$5M (7 pts)
+        if 500_000 <= mc <= 5_000_000:
+            score += 7; passed.append("MC $%.0fK in $500K–$5M sweet spot (+7)" % (mc / 1000))
+        else:
+            failed.append("MC $%.0fK outside $500K–$5M" % (mc / 1000))
+
+        # Liquidity > $100K (7 pts)
+        if liq >= 100_000:
+            score += 7; passed.append("Liquidity $%.0fK > $100K (+7)" % (liq / 1000))
+        else:
+            failed.append("Liquidity $%.0fK < $100K" % (liq / 1000))
+
+        # Liq/MC >= 10% (5 pts)
+        if mc > 0 and (liq / mc) >= 0.10:
+            score += 5; passed.append("Liq/MC %.1f%% >= 10%% (+5)" % (liq / mc * 100))
+        else:
+            ratio = (liq / mc * 100) if mc > 0 else 0
+            failed.append("Liq/MC %.1f%% < 10%%" % ratio)
+
+        # 24h volume > $50K (6 pts)
+        if vol24h >= 50_000:
+            score += 6; passed.append("24h volume $%.0fK > $50K (+6)" % (vol24h / 1000))
+        else:
+            failed.append("24h volume $%.0fK < $50K" % (vol24h / 1000))
+
+        # Volume organic 20%–100% of MC (5 pts)
+        if mc > 0:
+            vol_ratio = vol24h / mc
+            if 0.20 <= vol_ratio <= 1.0:
+                score += 5; passed.append("Volume organic %.0f%% of MC (+5)" % (vol_ratio * 100))
+            else:
+                failed.append("Volume %.0f%% of MC (suspect if >100%%)" % (vol_ratio * 100))
+
+        # Buy/sell > 1.2x (5 pts)
+        bs_ratio = buys / sells if sells > 0 else 0
+        if bs_ratio >= 1.2:
+            score += 5; passed.append("Buy/sell %.1fx > 1.2 (+5)" % bs_ratio)
+        else:
+            failed.append("Buy/sell %.1fx < 1.2" % bs_ratio)
+
+        # Pair age 24h–7 days (5 pts)
+        if 24 <= age_h <= 168:
+            score += 5; passed.append("Pair age %.0fh in 24h–7d (+5)" % age_h)
+        elif age_h < 24:
+            failed.append("Pair age %.0fh < 24h (too new)" % age_h)
+        else:
+            failed.append("Pair age %.0fh > 7 days (old)" % age_h)
+    else:
+        failed.append("DexScreener market data unavailable")
+
+    # ── Grade ─────────────────────────────────────────────────────────────────
+    if score >= 80:
+        grade = "A"
+    elif score >= 65:
+        grade = "B"
+    else:
+        grade = "C"
+
+    return score, grade, passed, failed, None
+
+# ── Message builder ───────────────────────────────────────────────────────────
+
+def build_report(address, chain_key, score, grade, passed, failed, hard_fail, dex):
+    chain_label = CHAIN_MAP.get(chain_key, {}).get("label", chain_key.upper())
+
+    if hard_fail:
+        return (
+            "MEMECOIN SCAN — REJECTED\n\n"
+            "Chain:   %s\n"
+            "Address: %s\n\n"
+            "%s\n\n"
+            "DO NOT BUY — exit immediately if holding."
+        ) % (chain_label, address[:12] + "..." + address[-6:], hard_fail)
+
+    token_name = ""
+    price_str  = ""
+    if dex:
+        token_name = (dex.get("baseToken") or {}).get("name", "")
+        token_sym  = (dex.get("baseToken") or {}).get("symbol", "")
+        price_usd  = dex.get("priceUsd") or "?"
+        if token_name:
+            token_name = "%s (%s)\n" % (token_name, token_sym)
+        price_str = "Price:   $%s\n" % price_usd
+
+    grade_line = {
+        "A": "GRADE A — STRONG CANDIDATE",
+        "B": "GRADE B — MODERATE CANDIDATE",
+        "C": "GRADE C — WEAK / SKIP",
+    }.get(grade, "GRADE ?")
+
+    passed_lines = "\n".join("  + %s" % p for p in passed[:8])
+    failed_lines = "\n".join("  - %s" % f for f in failed[:6])
+
+    action = {
+        "A": "Consider a position. Set SL at -20%%. Take partial at 2x.",
+        "B": "Small position only. Tight SL. Do not oversize.",
+        "C": "Skip or watch only. Too many red flags.",
+    }.get(grade, "")
+
+    return (
+        "MEMECOIN SCAN RESULT\n\n"
+        "%s"
+        "Chain:   %s\n"
+        "Address: %s\n"
+        "%s\n"
+        "%s — Score %d/100\n\n"
+        "PASSED:\n%s\n\n"
+        "FAILED:\n%s\n\n"
+        "ACTION: %s"
+    ) % (
+        token_name,
+        chain_label,
+        address[:12] + "..." + address[-6:],
+        price_str,
+        grade_line,
+        score,
+        passed_lines or "  (none)",
+        failed_lines or "  (none)",
+        action,
+    )
+
+# ── Seen / results store ──────────────────────────────────────────────────────
 
 def load_seen():
-    if not os.path.exists(SEEN_FILE):
-        return set()
     try:
-        with open(SEEN_FILE, "r") as f:
+        with open(SEEN_FILE) as f:
             return set(json.load(f))
     except Exception:
         return set()
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen)[-MAX_SEEN:], f)
+        json.dump(list(seen), f)
 
 def load_results():
-    if not os.path.exists(RESULTS_FILE):
-        return []
     try:
-        with open(RESULTS_FILE, "r") as f:
+        with open(RESULTS_FILE) as f:
             return json.load(f)
     except Exception:
         return []
 
-def save_result(result):
+def save_result(entry):
     results = load_results()
-    results.append(result)
+    results.insert(0, entry)
+    results = results[:50]
     with open(RESULTS_FILE, "w") as f:
-        json.dump(results[-100:], f, indent=2)
+        json.dump(results, f, indent=2)
 
-def fv(n):
-    if n is None: return "N/A"
-    if n >= 1e9:  return "$%.2fB" % (n / 1e9)
-    if n >= 1e6:  return "$%.2fM" % (n / 1e6)
-    if n >= 1e3:  return "$%.1fK" % (n / 1e3)
-    return "$%.2f" % n
+# ── Core scan function ────────────────────────────────────────────────────────
 
-# ── GoPlusLabs security fetch ─────────────────────────────────────────────────
+async def scan_and_notify(bot, address, chain_key):
+    gp    = fetch_goplus(address, chain_key)
+    dex   = fetch_dexscreener(address)
+    score, grade, passed, failed, hard_fail = score_token(gp, dex, chain_key)
 
-def fetch_security(chain_id, address):
-    data = safe_get(GOPLUS_URL % chain_id)
-    if not data:
-        return None
-    # GoPlusLabs takes address as query param
-    data = safe_get((GOPLUS_URL % chain_id) + "?contract_addresses=" + address)
-    if not data or not data.get("result"):
-        return None
-    result = data["result"].get(address.lower()) or data["result"].get(address)
-    return result
+    report = build_report(address, chain_key, score, grade, passed, failed, hard_fail, dex)
 
-# ── DexScreener market fetch ──────────────────────────────────────────────────
+    if grade in ("A", "B") and not hard_fail:
+        await bot.send_message(chat_id=CHAT_ID, text=report)
+        log.info("Alert sent: %s grade=%s score=%d" % (address[:12], grade, score))
 
-def fetch_dexscreen(address):
-    data = safe_get(DEXSCREEN_TOKEN % address)
-    if not data or not data.get("pairs"):
-        return None
-    # Return the pair with highest liquidity
-    pairs = data["pairs"]
-    pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-    return pairs[0] if pairs else None
+    return {
+        "address":    address,
+        "chain":      chain_key,
+        "score":      score,
+        "grade":      grade,
+        "hard_fail":  hard_fail,
+        "timestamp":  datetime.now(timezone.utc).isoformat(),
+    }
 
-# ── Core analyser ─────────────────────────────────────────────────────────────
+# ── Auto-scanner loop ─────────────────────────────────────────────────────────
 
-def analyse_token(address, chain_id, chain_label):
-    """
-    Returns (passed, grade, score, details, hard_fail_reason) or None on API error.
-    """
-    sec  = fetch_security(chain_id, address)
-    pair = fetch_dexscreen(address)
-
-    if not sec and not pair:
-        return None
-
-    checks  = {}   # check_name → (passed: bool, note: str)
-    score   = 0
-    hard_fails = []
-
-    # ── HARD GATES — instant reject if any fail ───────────────────────────────
-
-    if sec:
-        # Honeypot
-        if sec.get("is_honeypot") == "1":
-            hard_fails.append("HONEYPOT — cannot sell")
-        checks["Honeypot"] = (sec.get("is_honeypot") != "1", "")
-
-        # Contract verified
-        is_open = sec.get("is_open_source", "0") == "1"
-        if not is_open:
-            hard_fails.append("CONTRACT UNVERIFIED — source code hidden")
-        checks["Verified contract"] = (is_open, "")
-
-        # Taxes
-        buy_tax  = float(sec.get("buy_tax",  "0") or 0) * 100
-        sell_tax = float(sec.get("sell_tax", "0") or 0) * 100
-        if sell_tax > 15:
-            hard_fails.append("SELL TAX %.0f%% — exit trap" % sell_tax)
-        if buy_tax > 15:
-            hard_fails.append("BUY TAX %.0f%% — entry trap" % buy_tax)
-        checks["Buy tax ≤10%%"]  = (buy_tax  <= 10, "%.1f%%" % buy_tax)
-        checks["Sell tax ≤10%%"] = (sell_tax <= 10, "%.1f%%" % sell_tax)
-
-        # Asymmetric tax (sell tax notably higher than buy = dump trap)
-        if sell_tax > buy_tax + 5:
-            hard_fails.append("ASYMMETRIC TAX — sell %.0f%% vs buy %.0f%%" % (sell_tax, buy_tax))
-
-    if hard_fails:
-        return (False, "FAIL", 0, checks, hard_fails[0])
-
-    # ── SCORED SECURITY CHECKS (40 pts) ──────────────────────────────────────
-
-    if sec:
-        def flag(key, pts, label):
-            nonlocal score
-            val = sec.get(key, "0")
-            passed = (val == "0" or val is None or val == "")
-            if passed:
-                score += pts
-            checks[label] = (passed, "")
-            return passed
-
-        flag("is_mintable",               8,  "No mint function")
-        flag("is_blacklisted",            8,  "No blacklist function")
-        flag("transfer_pausable",         7,  "No transfer pause")
-        flag("is_proxy",                  6,  "No proxy contract")
-        flag("hidden_owner",              5,  "No hidden owner")
-        flag("selfdestruct",              4,  "No self-destruct")
-        flag("can_take_back_ownership",   2,  "Cannot reclaim ownership")
-
-        # Contract renounced
-        owner = (sec.get("owner_address") or "").lower()
-        renounced = owner in ("", "0x0000000000000000000000000000000000000000")
-        if renounced:
-            score += 5
-        checks["Contract renounced"] = (renounced, "owner: %s" % (owner[:10] + "..." if owner else "none"))
-
-    # ── SCORED DISTRIBUTION CHECKS (25 pts) ──────────────────────────────────
-
-    if sec:
-        # Dev/creator wallet
-        creator_pct = float(sec.get("creator_percent", "0") or 0) * 100
-        dev_ok = creator_pct < 5
-        if dev_ok:
-            score += 10
-        checks["Dev wallet <5%%"] = (dev_ok, "%.1f%%" % creator_pct)
-
-        # Top 10 holders < 20%
-        holders_list = sec.get("holders", []) or []
-        top10_pct = sum(float(h.get("percent", 0) or 0) * 100 for h in holders_list[:10])
-        top10_ok = top10_pct < 20
-        if top10_ok:
-            score += 10
-        checks["Top 10 holders <20%%"] = (top10_ok, "%.1f%%" % top10_pct)
-
-        # LP locked
-        lp_locked = False
-        lp_holders = sec.get("lp_holders", []) or []
-        for lp in lp_holders:
-            if lp.get("is_locked") == 1 or str(lp.get("is_locked")) == "1":
-                lp_locked = True
-                break
-        if lp_locked:
-            score += 5
-        checks["LP locked"] = (lp_locked, "")
-
-    # ── SCORED MARKET CHECKS (35 pts) ────────────────────────────────────────
-
-    if pair:
-        liq_usd  = float(pair.get("liquidity", {}).get("usd", 0) or 0)
-        fdv      = float(pair.get("fdv", 0) or 0)
-        vol_24h  = float(pair.get("volume", {}).get("h24", 0) or 0)
-        txns_24h = pair.get("txns", {}).get("h24", {})
-        buys_24h = int(txns_24h.get("buys",  0) or 0)
-        sels_24h = int(txns_24h.get("sells", 0) or 0)
-        price_chg_24h = float(pair.get("priceChange", {}).get("h24", 0) or 0)
-        pair_age_ms   = pair.get("pairCreatedAt")
-        pair_age_h    = ((time.time() * 1000 - pair_age_ms) / 3600000) if pair_age_ms else 0
-
-        # MC range $500K–$5M
-        mc_ok = 500_000 <= fdv <= 5_000_000
-        if mc_ok:
-            score += 10
-        elif fdv < 500_000:
-            score += 3   # too small but not zero
-        checks["MC $500K–$5M"] = (mc_ok, fv(fdv))
-
-        # Liquidity > $100K
-        liq_ok = liq_usd >= 100_000
-        if liq_ok:
-            score += 8
-        elif liq_usd >= 50_000:
-            score += 3
-        checks["Liquidity >$100K"] = (liq_ok, fv(liq_usd))
-
-        # Liquidity ≥ 10% of MC (depth quality)
-        liq_ratio = liq_usd / fdv * 100 if fdv > 0 else 0
-        liq_ratio_ok = liq_ratio >= 10
-        if liq_ratio_ok:
-            score += 5
-        checks["Liq ≥10%% of MC"] = (liq_ratio_ok, "%.1f%%" % liq_ratio)
-
-        # Volume $50K+ in 24h
-        vol_ok = vol_24h >= 50_000
-        if vol_ok:
-            score += 5
-        checks["Volume >$50K 24h"] = (vol_ok, fv(vol_24h))
-
-        # Volume/MC ratio 20–100% (organic)
-        vol_mc_ratio = vol_24h / fdv * 100 if fdv > 0 else 0
-        vol_organic  = 20 <= vol_mc_ratio <= 100
-        if vol_organic:
-            score += 5
-        elif vol_mc_ratio > 100:
-            checks["Volume organic"] = (False, "%.0f%% — possible bots" % vol_mc_ratio)
-        else:
-            checks["Volume organic"] = (False, "%.0f%% — low activity" % vol_mc_ratio)
-        if vol_organic:
-            checks["Volume organic"] = (True, "%.0f%% of MC" % vol_mc_ratio)
-
-        # Buy/sell ratio > 1.2
-        bs_ratio = buys_24h / sels_24h if sels_24h > 0 else (2.0 if buys_24h > 0 else 1.0)
-        bs_ok    = bs_ratio >= 1.2
-        if bs_ok:
-            score += 7
-        checks["Buy/sell >1.2x"] = (bs_ok, "%.2fx (%d/%d)" % (bs_ratio, buys_24h, sels_24h))
-
-        # Token age 24h–7 days
-        age_ok = 24 <= pair_age_h <= 168
-        if age_ok:
-            score += 3
-        elif pair_age_h < 24:
-            checks["Age 24h–7 days"] = (False, "%.1fh old — too new" % pair_age_h)
-        else:
-            checks["Age 24h–7 days"] = (False, "%.0fd old — pump may be done" % (pair_age_h / 24))
-        if age_ok:
-            checks["Age 24h–7 days"] = (True, "%.1fh" % pair_age_h)
-
-    # ── Grade ─────────────────────────────────────────────────────────────────
-
-    if score >= 80:
-        grade = "A"
-    elif score >= 65:
-        grade = "B"
-    elif score >= 50:
-        grade = "C"
-    else:
-        grade = "D"
-
-    passed = grade in ("A", "B")
-    return (passed, grade, score, checks, None)
-
-# ── Alert builder ─────────────────────────────────────────────────────────────
-
-def build_alert(address, chain_label, name, symbol, grade, score, checks, pair):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-
-    grade_line = {
-        "A": "A  STRONG CANDIDATE",
-        "B": "B  MODERATE — proceed carefully",
-    }.get(grade, grade)
-
-    passed_checks  = [k for k, (p, _) in checks.items() if p]
-    failed_checks  = [k for k, (p, _) in checks.items() if not p]
-    detail_lines   = []
-    for k, (p, note) in checks.items():
-        icon = "PASS" if p else "FAIL"
-        line = "  %s  %s" % (icon, k)
-        if note:
-            line += "  [%s]" % note
-        detail_lines.append(line)
-
-    market_lines = ""
-    if pair:
-        fdv     = float(pair.get("fdv", 0) or 0)
-        liq_usd = float(pair.get("liquidity", {}).get("usd", 0) or 0)
-        vol_24h = float(pair.get("volume", {}).get("h24", 0) or 0)
-        price   = pair.get("priceUsd", "N/A")
-        dex_url = pair.get("url", "")
-        market_lines = (
-            "\n=== MARKET DATA ===\n"
-            "Price:      $%s\n"
-            "Market Cap: %s\n"
-            "Liquidity:  %s\n"
-            "Vol 24h:    %s\n"
-            "%s"
-        ) % (
-            price, fv(fdv), fv(liq_usd), fv(vol_24h),
-            ("\nChart: %s" % dex_url) if dex_url else "",
-        )
-
-    return (
-        "MEMECOIN ALERT — GRADE %s\n"
-        "\n"
-        "Token:   %s (%s)\n"
-        "Chain:   %s\n"
-        "Score:   %d / 100\n"
-        "Grade:   %s\n"
-        "%s"
-        "\n"
-        "=== CHECKS (%d pass / %d fail) ===\n"
-        "%s\n"
-        "\n"
-        "Address: %s\n"
-        "\n"
-        "NOT financial advice. Always verify\n"
-        "manually before entering.\n"
-        "Time: %s UTC"
-    ) % (
-        grade,
-        name, symbol,
-        chain_label,
-        score,
-        grade_line,
-        market_lines,
-        len(passed_checks), len(failed_checks),
-        "\n".join(detail_lines),
-        address,
-        now,
-    )
-
-def build_hardfail_alert(address, chain_label, name, reason):
-    return (
-        "MEMECOIN REJECTED — %s\n"
-        "\n"
-        "Token:  %s\n"
-        "Chain:  %s\n"
-        "Reason: %s\n"
-        "\n"
-        "This token failed a hard security gate.\n"
-        "Do NOT buy — this is a danger signal.\n"
-        "\n"
-        "Address: %s\n"
-        "Time: %s UTC"
-    ) % (
-        reason.split(" ")[0],
-        name, chain_label, reason, address,
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-    )
-
-# ── Main scanner loop ─────────────────────────────────────────────────────────
-
-async def scan_loop(bot):
+async def auto_scan_loop(bot):
     seen = load_seen()
-    scan_count = 0
+    log.info("Auto-scanner started")
 
     while True:
-        scan_count += 1
-        log.info("Memecoin scan #%d..." % scan_count)
-        alerts_sent = 0
+        try:
+            tokens = fetch_latest_tokens()
+            for token in tokens:
+                addr      = token.get("tokenAddress") or token.get("address") or ""
+                chain_raw = token.get("chainId") or ""
+                chain_key = DEX_TO_CHAIN.get(chain_raw.lower())
 
-        data = safe_get(DEXSCREEN_LATEST)
-        if not data:
-            await asyncio.sleep(SCAN_INTERVAL)
-            continue
+                if not addr or not chain_key:
+                    continue
+                if addr in seen:
+                    continue
 
-        tokens = data if isinstance(data, list) else data.get("data", [])
-
-        for token in tokens:
-            chain   = token.get("chainId", "")
-            address = token.get("tokenAddress", "")
-
-            if not address or chain not in CHAIN_MAP:
-                continue
-
-            uid = "%s_%s" % (chain, address.lower())
-            if uid in seen:
-                continue
-            seen.add(uid)
-
-            chain_info = CHAIN_MAP[chain]
-            chain_id   = chain_info["goplus_id"]
-            chain_label = chain_info["label"]
-
-            # Get token name from DexScreener pair
-            pair = fetch_dexscreen(address)
-            time.sleep(0.3)
-
-            if not pair:
-                continue
-
-            name   = pair.get("baseToken", {}).get("name",   "Unknown")
-            symbol = pair.get("baseToken", {}).get("symbol", "???")
-
-            log.info("Analysing: %s (%s) on %s" % (name, symbol, chain_label))
-
-            result = analyse_token(address, chain_id, chain_label)
-            time.sleep(0.5)
-
-            if result is None:
-                continue
-
-            passed, grade, score, checks, hard_fail = result
-
-            if hard_fail:
-                # Send danger alert for honeypots and severe tax traps
-                if "HONEYPOT" in hard_fail or "TAX" in hard_fail:
-                    try:
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=build_hardfail_alert(address, chain_label, name, hard_fail),
-                            disable_web_page_preview=True,
-                        )
-                        alerts_sent += 1
-                        log.info("Hard fail alert: %s — %s" % (symbol, hard_fail))
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        log.error("Alert error: %s" % e)
-                continue
-
-            if passed:
-                msg = build_alert(address, chain_label, name, symbol, grade, score, checks, pair)
+                seen.add(addr)
                 try:
-                    await bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=msg,
-                        disable_web_page_preview=True,
-                    )
-                    save_result({
-                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                        "name": name, "symbol": symbol, "grade": grade,
-                        "score": score, "chain": chain_label, "address": address,
-                    })
-                    alerts_sent += 1
-                    log.info("Alert sent: %s grade=%s score=%d" % (symbol, grade, score))
-                    await asyncio.sleep(2)
+                    result = await scan_and_notify(bot, addr, chain_key)
+                    save_result(result)
                 except Exception as e:
-                    log.error("Alert error: %s" % e)
+                    log.error("Scan error %s: %s" % (addr[:12], e))
+                await asyncio.sleep(1)
 
-        save_seen(seen)
-        log.info("Scan #%d done. %d alerts sent." % (scan_count, alerts_sent))
+            save_seen(seen)
+        except Exception as e:
+            log.error("Auto-scan loop error: %s" % e)
+
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ── Manual /scan command ──────────────────────────────────────────────────────
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+async def handle_help(bot, chat_id):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "MEMECOIN SCANNER — COMMANDS\n\n"
+            "/scan ADDRESS [chain]\n"
+            "  Scan a token. Chain is optional for Solana\n"
+            "  (auto-detected). For EVM chains specify:\n"
+            "  eth, bsc, base, arb, polygon, avax\n\n"
+            "Examples:\n"
+            "  /scan 0x1234...abcd eth\n"
+            "  /scan So1ана...token  (Solana auto-detected)\n"
+            "  /scan 0x5678...efgh bsc\n\n"
+            "/recent\n"
+            "  Last 10 scan results\n\n"
+            "Supported chains:\n"
+            "  Ethereum (eth)\n"
+            "  BSC (bsc/bnb)\n"
+            "  Base (base)\n"
+            "  Solana (sol/solana)\n"
+            "  Arbitrum (arb/arbitrum)\n"
+            "  Polygon (polygon/matic)\n"
+            "  Avalanche (avax/avalanche)\n\n"
+            "Auto-scan runs every 5 minutes across\n"
+            "all chains via DexScreener."
+        )
+    )
 
 async def handle_scan(bot, chat_id, args):
     if not args:
         await bot.send_message(
             chat_id=chat_id,
-            text=(
-                "Usage: /scan ADDRESS [CHAIN]\n"
-                "Chains: eth, bsc, base\n\n"
-                "Example:\n"
-                "/scan 0xabc123... eth"
-            )
+            text="Usage: /scan ADDRESS [chain]\nExample: /scan 0x1234...abcd eth"
         )
         return
 
-    address = args[0].strip()
-    chain_input = args[1].lower() if len(args) > 1 else "eth"
+    address   = args[0].strip()
+    chain_arg = args[1].lower() if len(args) > 1 else None
 
-    chain_lookup = {"eth": "ethereum", "bsc": "bsc", "base": "base",
-                    "ethereum": "ethereum", "bnb": "bsc"}
-    chain = chain_lookup.get(chain_input, "ethereum")
-    chain_info  = CHAIN_MAP[chain]
-    chain_id    = chain_info["goplus_id"]
-    chain_label = chain_info["label"]
-
-    await bot.send_message(chat_id=chat_id,
-                           text="Scanning %s on %s..." % (address[:12] + "...", chain_label))
-
-    pair   = fetch_dexscreen(address)
-    name   = pair.get("baseToken", {}).get("name",   "Unknown") if pair else "Unknown"
-    symbol = pair.get("baseToken", {}).get("symbol", "???")     if pair else "???"
-
-    result = analyse_token(address, chain_id, chain_label)
-
-    if result is None:
-        await bot.send_message(chat_id=chat_id,
-                               text="Could not fetch data for this token. Check the address and chain.")
-        return
-
-    passed, grade, score, checks, hard_fail = result
-
-    if hard_fail:
+    if chain_arg and chain_arg not in CHAIN_MAP:
         await bot.send_message(
             chat_id=chat_id,
-            text=build_hardfail_alert(address, chain_label, name, hard_fail),
-            disable_web_page_preview=True,
+            text=(
+                "Unknown chain: %s\n\n"
+                "Valid chains: eth, bsc, base, sol,\n"
+                "arb, polygon, avax"
+            ) % chain_arg
         )
         return
 
-    msg = build_alert(address, chain_label, name, symbol, grade, score, checks, pair)
-    await bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
+    chain_key = chain_arg or guess_chain(address)
+
+    if not chain_key:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "EVM address detected — please specify the chain:\n"
+                "/scan %s eth\n"
+                "/scan %s bsc\n"
+                "/scan %s base\n"
+                "/scan %s arb\n"
+                "etc."
+            ) % (address, address, address, address)
+        )
+        return
+
+    await bot.send_message(chat_id=chat_id,
+                           text="Scanning %s on %s..." % (
+                               address[:12] + "...", chain_key.upper()))
+
+    gp    = fetch_goplus(address, chain_key)
+    dex   = fetch_dexscreener(address)
+    score, grade, passed, failed, hard_fail = score_token(gp, dex, chain_key)
+    report = build_report(address, chain_key, score, grade, passed, failed, hard_fail, dex)
+
+    await bot.send_message(chat_id=chat_id, text=report)
+
+    save_result({
+        "address":   address,
+        "chain":     chain_key,
+        "score":     score,
+        "grade":     grade,
+        "hard_fail": hard_fail,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
 async def handle_recent(bot, chat_id):
-    results = load_results()
+    results = load_results()[:10]
     if not results:
         await bot.send_message(chat_id=chat_id,
-                               text="No tokens have passed screening yet.")
+                               text="No scans yet. Use /scan ADDRESS [chain]")
         return
-    recent = list(reversed(results[-10:]))
-    lines  = ["RECENT PASSED TOKENS\n"]
-    for r in recent:
-        lines.append("%s  %s (%s)  Grade %s  Score %d  [%s]" % (
-            r["time"], r["name"], r["symbol"], r["grade"], r["score"], r["chain"]))
+
+    lines = ["RECENT SCANS\n"]
+    for i, r in enumerate(results, 1):
+        ts    = r.get("timestamp", "")[:16].replace("T", " ")
+        addr  = r.get("address", "")
+        short = addr[:10] + "..." + addr[-6:] if len(addr) > 16 else addr
+        grade = r.get("grade", "?")
+        score = r.get("score", 0)
+        chain = r.get("chain", "?").upper()
+        hf    = " REJECTED" if r.get("hard_fail") else ""
+        lines.append("%d. [%s] %s  %s  %s Grade %s (%d)%s" % (
+            i, ts, short, chain, "", grade, score, hf))
+
     await bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -569,26 +595,7 @@ async def dispatch(bot, message):
     args    = parts[1:]
 
     if cmd == "/help":
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "MEMECOIN SCANNER — COMMANDS\n\n"
-                "/scan ADDRESS [CHAIN]\n"
-                "  Scan any token manually\n"
-                "  Chains: eth, bsc, base\n"
-                "  Example: /scan 0xabc... eth\n\n"
-                "/recent\n"
-                "  Last 10 tokens that passed\n\n"
-                "Auto-scan runs every 5 minutes\n"
-                "across ETH, BSC, and Base.\n\n"
-                "Grades:\n"
-                "  A (80+)  — strong candidate\n"
-                "  B (65+)  — moderate, be careful\n"
-                "  C/D      — not alerted (too risky)\n\n"
-                "26 checks across security,\n"
-                "distribution, and market quality."
-            )
-        )
+        await handle_help(bot, chat_id)
     elif cmd == "/scan":
         await handle_scan(bot, chat_id, args)
     elif cmd == "/recent":
@@ -605,26 +612,20 @@ async def main():
         chat_id=CHAT_ID,
         text=(
             "Memecoin Scanner Online!\n\n"
-            "Auto-scanning ETH, BSC, and Base\n"
-            "every 5 minutes for new tokens.\n\n"
-            "Running 26 checks per token:\n"
-            "  SECURITY  — honeypot, taxes, functions,\n"
-            "              ownership, contract safety\n"
-            "  DISTRIBUTION — dev wallet, top holders,\n"
-            "                 LP lock status\n"
-            "  MARKET    — MC range, liquidity depth,\n"
-            "              volume quality, buy/sell ratio\n\n"
-            "Alerts sent for Grade A (80+) and B (65+).\n"
-            "Honeypots and tax traps flagged immediately.\n\n"
+            "Scanning across 7 chains:\n"
+            "  Ethereum  BSC  Base\n"
+            "  Solana  Arbitrum  Polygon  Avalanche\n\n"
+            "26-point safety check on every token.\n"
+            "Only Grade A/B alerts sent.\n\n"
+            "Auto-scan runs every 5 minutes.\n\n"
             "Commands:\n"
-            "  /scan ADDRESS [eth/bsc/base]\n"
-            "  /recent — last 10 passed tokens\n\n"
-            "NOT financial advice. Always verify\n"
-            "manually before entering any position."
+            "  /scan ADDRESS [chain]\n"
+            "  /recent\n"
+            "  /help"
         )
     )
 
-    asyncio.create_task(scan_loop(bot))
+    asyncio.create_task(auto_scan_loop(bot))
 
     while True:
         try:
@@ -637,7 +638,7 @@ async def main():
         except Exception as e:
             log.error("Poll error: %s" % e)
             await asyncio.sleep(5)
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
