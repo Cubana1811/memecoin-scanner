@@ -70,6 +70,18 @@ DEXSCREEN_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREEN_TOKEN  = "https://api.dexscreener.com/latest/dex/tokens/%s"
 SOLSCAN_HOLDERS  = "https://public-api.solscan.io/token/holders?tokenAddress=%s&limit=20&offset=0"
 
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
+
+EXPLORER_URLS = {
+    "ethereum": "https://api.etherscan.io/api",
+    "eth":      "https://api.etherscan.io/api",
+    "bsc":      "https://api.bscscan.com/api",
+    "bnb":      "https://api.bscscan.com/api",
+    "base":     "https://api.basescan.org/api",
+    "arbitrum": "https://api.arbiscan.io/api",
+    "arb":      "https://api.arbiscan.io/api",
+}
+
 # ── Address helpers ───────────────────────────────────────────────────────────
 
 def is_solana_address(address):
@@ -131,6 +143,32 @@ def fetch_solscan_holders(address):
         return data.get("data") or [], data.get("total") or 0
     except Exception:
         return [], 0
+
+def fetch_contract_creation_time(address, chain_key):
+    """Returns contract creation Unix timestamp or None."""
+    api_url = EXPLORER_URLS.get(chain_key)
+    if not api_url or not ETHERSCAN_API_KEY:
+        return None
+    try:
+        resp = requests.get(api_url, params={
+            "module":     "account",
+            "action":     "txlist",
+            "address":    address,
+            "page":       1,
+            "offset":     1,
+            "sort":       "asc",
+            "startblock": 0,
+            "endblock":   99999999,
+            "apikey":     ETHERSCAN_API_KEY,
+        }, timeout=10)
+        data = resp.json()
+        if data.get("status") != "1" or not data.get("result"):
+            return None
+        ts = int(data["result"][0].get("timeStamp", 0))
+        return ts if ts > 0 else None
+    except Exception as e:
+        log.warning("Explorer API error: %s" % e)
+        return None
 
 def fetch_latest_tokens():
     try:
@@ -707,12 +745,27 @@ def score_token_full(address, gp, dex, chain_key):
         else:
             failed.append("24h price %.0f%% — declining" % pc24h)
 
-        if 24 <= age_h <= 168:
-            score += 4; passed.append("Pair age %.0fh in 24h–7d sweet spot (+4)" % age_h)
-        elif age_h < 24:
-            failed.append("Pair age %.0fh < 24h — very new, high risk" % age_h)
+        # Contract age vs pair age gap (4 pts)
+        contract_ts = fetch_contract_creation_time(address, chain_key)
+        if contract_ts and age_ms:
+            pair_ts  = age_ms / 1000
+            gap_days = (pair_ts - contract_ts) / 86400
+            if gap_days <= 0:
+                score += 4; passed.append("Contract created at launch — organic (+4)")
+            elif gap_days <= 7:
+                score += 4; passed.append("Contract %.0fd before launch — organic (+4)" % gap_days)
+            elif gap_days <= 30:
+                score += 2; passed.append("Contract %.0fd before launch — acceptable (+2)" % gap_days)
+            else:
+                failed.append("Contract deployed %.0f days before launch — suspicious" % gap_days)
         else:
-            failed.append("Pair age %.0fh > 7 days" % age_h)
+            # Fall back to pair age if no explorer data
+            if 24 <= age_h <= 168:
+                score += 2; passed.append("Pair age %.0fh in range (+2)" % age_h)
+            elif age_h < 24:
+                failed.append("Pair age %.0fh < 24h — very new" % age_h)
+            else:
+                failed.append("Pair age %.0fh > 7 days" % age_h)
     else:
         failed.append("Momentum data unavailable")
 
